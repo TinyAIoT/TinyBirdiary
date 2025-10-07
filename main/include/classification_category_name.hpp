@@ -1,5 +1,5 @@
 #pragma once
-static const char *bird_cat_names[] = {
+static const char *classification_cat_names[] = {
     "acanthis_flammea",
     "aegithalos_caudatus",
     "anthornis_melanura",
