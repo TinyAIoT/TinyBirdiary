@@ -8,9 +8,11 @@ There are two variables at the beginning of app_main.cpp which determine if came
 ```
 
 ## TAKE_PICTURE true && SAVE_TO_SDCARD false
+### warning: this is currently configured for the overtakes
 Images are continuously captured by the camera and classified.
 
 ## TAKE_PICTURE true && SAVE_TO_SDCARD true
+### warning: this is currently configured for the overtakes
 Images are continuously captured by the camera and classified. The images along with their classification results are saved to sd.
 
 ## TAKE_PICTURE false && SAVE_TO_SDCARD true
@@ -26,3 +28,4 @@ These images are loaded, classified and the result saved to a new folder `classi
 
 ## TAKE_PICTURE false && SAVE_TO_SDCARD false
 Classifies the given `example.jpg` in the `data` folder.
+

@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <cstring>
 #include <cstdio>
+#include <errno.h>
 
 #include "esp_jpeg_enc.h"
 #include "dl_image_jpeg.hpp"
@@ -278,7 +279,7 @@ bool save_classified_jpeg(const dl::image::img_t &img,
     float score = best.cat_name ? best.score : 0.0f;
 
     char filepath[256];
-    std::snprintf(filepath, sizeof(filepath), "%s/%04d_%s_%.3f.jpg", dir_full_path, idx + 1, cat, score);
+    std::snprintf(filepath, sizeof(filepath), "%s/%06d_%s_%.3f.jpg", dir_full_path, idx + 1, cat, score);
 
     ESP_LOGI(TAG, "Saving classified JPEG: %s", filepath);
 
@@ -291,6 +292,37 @@ bool save_classified_jpeg(const dl::image::img_t &img,
 
     ESP_LOGI(TAG, "Saved successfully");
     free(jpeg_img.data);
+    return true;
+}
+
+bool append_line(const char *filepath, const char *line) {
+    if (!g_mounted) {
+        ESP_LOGE(TAG, "append_line: SD not mounted");
+        return false;
+    }
+    if (!filepath || !line) {
+        ESP_LOGE(TAG, "append_line: invalid arguments");
+        return false;
+    }
+
+    FILE *file = fopen(filepath, "a");
+    if (!file) {
+        ESP_LOGE(TAG, "Failed to open %s for append (errno=%d)", filepath, errno);
+        return false;
+    }
+
+    int written = fprintf(file, "%s\n", line);
+    if (written < 0) {
+        ESP_LOGE(TAG, "Failed to write line to %s", filepath);
+        fclose(file);
+        return false;
+    }
+
+    if (fflush(file) != 0) {
+        ESP_LOGW(TAG, "fflush failed for %s (errno=%d)", filepath, errno);
+    }
+
+    fclose(file);
     return true;
 }
 

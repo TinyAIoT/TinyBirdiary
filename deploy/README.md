@@ -1,0 +1,2 @@
+# For Testing a trained and compressed model
+This ESP-IDF script is for testing a trained esp-dl model. It can be either tested on images taken by the connected camera or on images on a given sd-card. Images are continuously captured by the camera and classified. The images along with their classification results are saved to sd.
