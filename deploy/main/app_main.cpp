@@ -42,8 +42,8 @@
 #include <time.h>
 
 // WiFi Configuration - UPDATE THESE WITH YOUR CREDENTIALS
-#define WIFI_SSID      "GIATSCHOOL-NET"
-#define WIFI_PASSWORD      "werockschools"
+#define WIFI_SSID      "..."
+#define WIFI_PASSWORD      "..."
 #define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
 #define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
 static const char *TAG = "wifi station";
@@ -98,6 +98,8 @@ static const int MAX_RETRY = 5;
 ImageRingBuffer ring_buffer;
 const char *out_dir = "/sdcard/classification";
 char background_log_path[128];
+
+bool pause_capture = false;
 
 static void obtain_time(void)
 {
@@ -212,31 +214,10 @@ void wifi_init_sta(void)
     }
 }
 
-static const dl::cls::result_t run_inference(dl::image::img_t &input_img) {
-    char dir[64];
-    snprintf(dir, sizeof(dir), "%s/espdl_models", CONFIG_BSP_SD_MOUNT_POINT);
-
-    dl::Model *model = nullptr;
-    dl::image::ImagePreprocessor *m_image_preprocessor = nullptr;
-
-    model = new dl::Model(model_path, dir, static_cast<fbs::model_location_type_t>(0));
-    if (!model) {
-        ESP_LOGE("MODEL", "Failed to create model");
-        return {};
-    }
-    model->minimize();
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-
+static const dl::cls::result_t run_inference(dl::Model *model, dl::image::ImagePreprocessor *m_image_preprocessor, dl::image::img_t &input_img) {
     uint32_t t0, t1;
     float delta;
     t0 = esp_timer_get_time();
-    m_image_preprocessor = new dl::image::ImagePreprocessor(model, {123.675, 116.28, 103.53}, {58.395, 57.12, 57.375}, DL_IMAGE_CAP_RGB565_BIG_ENDIAN);
-    if (!m_image_preprocessor) {
-        ESP_LOGE("PREPROCESSOR", "Failed to create image preprocessor");
-        delete model;
-        return {};
-    }
 
     m_image_preprocessor->preprocess(input_img);
 
@@ -258,15 +239,6 @@ static const dl::cls::result_t run_inference(dl::image::img_t &input_img) {
             best_result = res;
             found_result = true;
         }
-    }
-
-    if (m_image_preprocessor) {
-        delete m_image_preprocessor;
-        m_image_preprocessor = nullptr;
-    }
-    if (model) {
-        delete model;
-        model = nullptr;
     }
 
     return best_result;
@@ -296,7 +268,7 @@ static camera_config_t camera_config = {
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_RGB565,
+    .pixel_format = PIXFORMAT_JPEG,
     .frame_size = FRAMESIZE_QVGA,
 
     .jpeg_quality = 8,
@@ -317,7 +289,7 @@ static esp_err_t init_camera(void) {
     return err;
 }
 
-static bool capture_image(dl::image::img_t &output_img) {
+static bool capture_image(dl::image::jpeg_img_t &output_img) {
     ESP_LOGI("CAM", "Taking picture...");
     camera_fb_t *pic = esp_camera_fb_get();
     if (!pic) {
@@ -330,9 +302,9 @@ static bool capture_image(dl::image::img_t &output_img) {
 
     output_img.height = pic->height;
     output_img.width = pic->width;
-    output_img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565;
+    output_img.data_size = pic->len;
 
-    output_img.data = malloc(pic->len);
+    output_img.data = static_cast<uint8_t*>(malloc(pic->len));
     if (!output_img.data) {
         ESP_LOGE("MEM", "Memory allocation failed");
         esp_camera_fb_return(pic);
@@ -368,6 +340,8 @@ jpeg_error_t encode_img_to_jpeg(dl::image::img_t *img, dl::image::jpeg_img_t *jp
     {
         jpeg_img->data = outbuf;
         jpeg_img->data_size = out_len;
+        jpeg_img->width = img->width;
+        jpeg_img->height = img->height;
     }
     else
     {
@@ -391,7 +365,7 @@ static void camera_capture_task(void *pvParameters) {
         vTaskDelayUntil(&cLastWakeTime, cFrequency);
         // calc and print framerate
         uint32_t now = xTaskGetTickCount();
-        if (last_capture_time != 0) {
+        if (!pause_capture && last_capture_time != 0) {
             float seconds = (now - last_capture_time) * portTICK_PERIOD_MS / 1000.0f;
             if (seconds > 0.0f) {
                 float fps = 1.0f / seconds;
@@ -409,21 +383,33 @@ static void camera_capture_task(void *pvParameters) {
             }
         }
         last_capture_time = now;
+        if (pause_capture) {
+            ESP_LOGI("CAM", "Capture paused, skipping this frame");
+            continue;
+        }
+
         ESP_LOGI("CAM", "Free heap at start of loop: %lu bytes", esp_get_free_heap_size());
 
-        dl::image::img_t img;
+        dl::image::jpeg_img_t img;
         if (!capture_image(img)) {
             ESP_LOGE("CAM", "Could not take picture");
+            free(img.data);
+            img.data = nullptr;
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
 
+        ESP_LOGI("RINGBUFFER", "free heap size before malloc: %zu", esp_get_free_heap_size());
         if (!ring_buffer.add_image(img)) {
-            ESP_LOGE("TAKEOVER", "Could not add image to ring buffer");
+            ESP_LOGE("RINGBUFFER", "Could not add image to ring buffer");
+
             free(img.data);
             img.data = nullptr;
             continue;
         }
+
+        free(img.data);
+        img.data = nullptr;
     }
 }
 
@@ -434,6 +420,26 @@ static void classification_task(void *pvParameters) {
         ESP_LOGE("CLASSIFY", "Failed to initialize bird model");
         vTaskDelete(NULL);
     }
+    
+    // Initialize model once at the start of classification task
+    char dir[64];
+    snprintf(dir, sizeof(dir), "%s/espdl_models", CONFIG_BSP_SD_MOUNT_POINT);
+    dl::Model *model = new dl::Model(model_path, dir, static_cast<fbs::model_location_type_t>(0));
+    if (!model) {
+        ESP_LOGE("MODEL", "Failed to create model");
+        vTaskDelete(NULL);
+    }
+    model->minimize();
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    dl::image::ImagePreprocessor *m_image_preprocessor = nullptr;
+
+    m_image_preprocessor = new dl::image::ImagePreprocessor(model, {123.675, 116.28, 103.53}, {58.395, 57.12, 57.375}, DL_IMAGE_CAP_RGB565_BIG_ENDIAN);
+    if (!m_image_preprocessor) {
+        ESP_LOGE("PREPROCESSOR", "Failed to create image preprocessor");
+        vTaskDelete(NULL);
+    }
+    
     // rolling buffer for classification FPS (kept outside loop so initialized once)
     static float classification_fps_buf[50] = {0};
     static int classification_fps_buf_idx = 0;
@@ -458,96 +464,118 @@ static void classification_task(void *pvParameters) {
         }
         last_capture_time = now;
 
-        dl::image::img_t * img = ring_buffer.get_latest_image();
-        if (!img->data) {
+        dl::image::jpeg_img_t *img_jpeg = ring_buffer.get_latest_image();
+        if (!img_jpeg->data) {
             ESP_LOGE("CLASSIFY", "No image in ring buffer");
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // Convert RGB565 → RGB888
-        dl::image::img_t rgb888_img;
-        rgb888_img.height = img->height;
-        rgb888_img.width = img->width;
-        rgb888_img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
-        rgb888_img.data = malloc(img->height * img->width * 3);
-        if (!rgb888_img.data) {
-            ESP_LOGE("MEM", "Failed to allocate RGB888 buffer");
-            // free(img.data); TODO
-            continue;
-        }
-
-        dl::image::convert_img(*img, rgb888_img, 0, nullptr, {});
-        // free(img.data); TODO
-
-        // Run inference
-        const dl::cls::result_t best = run_inference(rgb888_img);
-        if (best.cat_name) {
-            ESP_LOGI("INF", "Prediction: %s (score: %.4f)", best.cat_name, best.score);
-        } else {
-            ESP_LOGW("INF", "No valid prediction");
-        }
+        // dl::image::jpeg_img_t img_jpeg;
+        // if (!capture_image(img_jpeg)) {
+        //     ESP_LOGE("CAM", "Could not take picture");
+        //     free(img_jpeg.data);
+        //     img_jpeg.data = nullptr;
+        //     vTaskDelay(pdMS_TO_TICKS(2000));
+        //     continue;
+        // }
         
-        // Save to SD and upload via WiFi if not background class
-        if (best.cat_name != classification_cat_names[0]) {
-            // Save to SD card
-            if (!sdcard::save_classified_jpeg(rgb888_img, best, out_dir)) {
-                ESP_LOGE("SD", "Failed to save classified JPEG");
-            }
-        } else {
-            // Append a log entry whenever background is detected
-            time_t ts;
-            time(&ts);
-            struct tm tm_info;
-            localtime_r(&ts, &tm_info);
+        // Decode JPEG BEFORE freeing encoded data
+        dl::image::img_t decoded_img;
+        decoded_img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
+        esp_err_t decode_err = ESP_OK;
+        
+        if (img_jpeg->data) {
+            decode_err = dl::image::sw_decode_jpeg(*img_jpeg, decoded_img, true);
 
-            char timestamp[32];
-            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info);
-
-            char line[128];
-            const char *cat = best.cat_name ? best.cat_name : "background";
-            snprintf(line, sizeof(line), "%s %s score=%.4f", timestamp, cat, best.score);
-
-            if (!sdcard::append_line(background_log_path, line)) {
-                ESP_LOGE("SD", "Failed to append background log");
+            if (decode_err != ESP_OK) {
+                ESP_LOGE("TESTI", "Failed to decode JPEG");
             } else {
-                ESP_LOGI("SD", "Background classification logged");
-            }
-        }
-            
-        // Encode to JPEG for upload
-        dl::image::jpeg_img_t encoded_jpeg_img;
-        jpeg_enc_config_t enc_config = {
-            .width = rgb888_img.width,
-            .height = rgb888_img.height,
-            .src_type = JPEG_PIXEL_FORMAT_RGB888,
-            .subsampling = JPEG_SUBSAMPLE_444,
-            .quality = 80,
-            .rotate = JPEG_ROTATE_0D,
-            .task_enable = false,
-            .hfm_task_priority = 13,
-            .hfm_task_core = 1,
-        };
+                // Run inference
+                dl::cls::result_t best = run_inference(model, m_image_preprocessor, decoded_img);
+                if (best.cat_name) {
+                    ESP_LOGI("INF", "Prediction: %s (score: %.4f)", best.cat_name, best.score);
+                } else {
+                    ESP_LOGW("INF", "No valid prediction");
+                }
+                
+                // Save to SD and upload via WiFi if not background class
+                if (best.cat_name != classification_cat_names[0]) {
+                    pause_capture = true;
+                    // Save to SD card
+                    if (!sdcard::save_classified_jpeg(*img_jpeg, best, out_dir)) {
+                        ESP_LOGE("SD", "Failed to save classified JPEG");
+                    }
+                
+                    // MQTT
+                    mqtt::send_classification(best);
+                    int index = ring_buffer.get_latest_index() + 1;
+                    for (int i = 0; i < RING_BUFFER_SIZE; ++i) {
+                        dl::image::jpeg_img_t *img_to_send = ring_buffer.get_image((index + RING_BUFFER_SIZE) % RING_BUFFER_SIZE);
+                        ESP_LOGI("MQTT", "Sending image index %d", (index + RING_BUFFER_SIZE) % RING_BUFFER_SIZE);  
+                        if (img_to_send && img_to_send->data) {
+                            mqtt::send_image(img_to_send->data, img_to_send->data_size);
+                        }
+                        index++;
+                    }
+                    pause_capture = false;
+                } else {
+                    // Append a log entry whenever background is detected
+                    time_t ts;
+                    time(&ts);
+                    struct tm tm_info;
+                    localtime_r(&ts, &tm_info);
 
-        jpeg_error_t encode_ret = encode_img_to_jpeg(&rgb888_img, &encoded_jpeg_img, enc_config);
-        
-        if (encode_ret == JPEG_ERR_OK) {
-            ESP_LOGI("JPEG", "Encoded JPEG: %zu bytes", encoded_jpeg_img.data_size);
-            
-            // MQTT
-            mqtt::send_image(encoded_jpeg_img.data, encoded_jpeg_img.data_size);
-            mqtt::send_classification(best);
-            
-            if (encoded_jpeg_img.data) {
-                free(encoded_jpeg_img.data);
+                    char timestamp[32];
+                    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info);
+
+                    char line[128];
+                    const char *cat = best.cat_name ? best.cat_name : "background";
+                    snprintf(line, sizeof(line), "%s %s score=%.4f", timestamp, cat, best.score);
+
+                    if (!sdcard::append_line(background_log_path, line)) {
+                        ESP_LOGE("SD", "Failed to append background log");
+                    } else {
+                        ESP_LOGI("SD", "Background classification logged");
+                    }
+                }
+            }
+
+            // Free decoded image data
+            if (decoded_img.data) {
+                free(decoded_img.data);
+                decoded_img.data = nullptr;
             }
         } else {
-            ESP_LOGE("JPEG", "Failed to encode JPEG");
+            ESP_LOGE("TESTI", "Skipping decode/inference due to previous JPEG encode error");
         }
 
-        free(rgb888_img.data);
+
+        // Now free the encoded data
+        if (img_jpeg->data) {
+            free(img_jpeg->data);
+            img_jpeg->data = nullptr;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (model) {
+        delete model;
+        model = nullptr;
+    }
+    if (m_image_preprocessor) {
+        delete m_image_preprocessor;
+        m_image_preprocessor = nullptr;
+    }
+}
+
+// In app_main(), create a time sync task
+static void time_sync_task(void *pvParameters) {
+    for(;;) {
+        vTaskDelay(pdMS_TO_TICKS(1200000)); // Every 20 minutes
+        obtain_time();
+        ESP_LOGI("TIME", "Time re-synchronized");
     }
 }
 
@@ -567,7 +595,7 @@ extern "C" void app_main(void) {
     // Initialize WiFi
     ESP_LOGI("WIFI", "Initializing WiFi...");
     wifi_init_sta();
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
     obtain_time();
 
     ESP_LOGI("SD", "Mounting SD card...");
@@ -596,4 +624,5 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(camera_capture_task,            "camera",           8192*2, NULL, 19, NULL, 0);
     vTaskDelay(500 / portTICK_PERIOD_MS);
     xTaskCreatePinnedToCore(classification_task,            "classification",   8192*2, NULL, 20, NULL, 1);
+    xTaskCreate(time_sync_task, "time_sync", 4096, NULL, 5, NULL);
 }

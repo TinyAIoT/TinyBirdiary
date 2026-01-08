@@ -1,2 +1,2 @@
-# For Testing a trained and compressed model
-This ESP-IDF script is for testing a trained esp-dl model. It can be either tested on images taken by the connected camera or on images on a given sd-card. Images are continuously captured by the camera and classified. The images along with their classification results are saved to sd.
+# senseBox Eye x Birdiary
+I am using the bird classification trained by Anni. Images are continuously captured at 6.6 FPS and cached in a ring buffer. Roughly every 0.7 seconds the most recent image from the ring buffer is classified. If it is not background, the classification result and all images in the ring buffer are send out via wifi and mqtt.

@@ -227,7 +227,7 @@ int count_files(const char *path) {
     return count;
 }
 
-bool save_classified_jpeg(const dl::image::img_t &img,
+bool save_classified_jpeg(dl::image::jpeg_img_t &img,
                           const dl::cls::result_t &best,
                           const char *dir_full_path) {
     if (!g_mounted) {
@@ -238,40 +238,16 @@ bool save_classified_jpeg(const dl::image::img_t &img,
         ESP_LOGE(TAG, "save_classified_jpeg: image has no data");
         return false;
     }
-    if (img.pix_type != dl::image::DL_IMAGE_PIX_TYPE_RGB888) {
-        ESP_LOGE(TAG, "save_classified_jpeg: image is not RGB888");
-        return false;
-    }
 
     // Make sure directory exists
     if (!create_dir(dir_full_path)) {
         return false;
     }
 
-    // Encode to JPEG
-    dl::image::jpeg_img_t jpeg_img;
-    jpeg_enc_config_t enc_cfg = {
-        .width = img.width,
-        .height = img.height,
-        .src_type = JPEG_PIXEL_FORMAT_RGB888,
-        .subsampling = JPEG_SUBSAMPLE_444,
-        .quality = 80,
-        .rotate = JPEG_ROTATE_0D,
-        .task_enable = true,
-        .hfm_task_priority = 13,
-        .hfm_task_core = 1,
-    };
-
-    jpeg_error_t enc_ret = encode_img_to_jpeg(&img, &jpeg_img, enc_cfg);
-    if (enc_ret != JPEG_ERR_OK) {
-        ESP_LOGE(TAG, "JPEG encoding failed (%d)", enc_ret);
-        return false;
-    }
-
     // Determine next index in directory
     int idx = count_files(dir_full_path);
     if (idx < 0) {
-        free(jpeg_img.data);
+        free(img.data);
         return false;
     }
 
@@ -283,15 +259,14 @@ bool save_classified_jpeg(const dl::image::img_t &img,
 
     ESP_LOGI(TAG, "Saving classified JPEG: %s", filepath);
 
-    esp_err_t write_err = dl::image::write_jpeg(jpeg_img, filepath);
+    esp_err_t write_err = dl::image::write_jpeg(img, filepath);
     if (write_err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to save JPEG: %s", filepath);
-        free(jpeg_img.data);
+        free(img.data);
         return false;
     }
 
     ESP_LOGI(TAG, "Saved successfully");
-    free(jpeg_img.data);
     return true;
 }
 
