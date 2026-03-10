@@ -1,0 +1,21 @@
+#pragma once
+static const char *classification_cat_names[] = {
+    "background",
+    "carduelis_carduelis",
+    "chloris_chloris",
+    "coccothraustes_coccothraustes",
+    "cyanistes_caeruleus",
+    "dendrocopos_major",
+    "erithacus_rubecula",
+    "fringilla_coelebs",
+    "garrulus_glandarius",
+    "homo_sapiens",
+    "parus_major",
+    "passer_domesticus",
+    "poecile_palustris",
+    "prunella_modularis",
+    "pyrrhula_pyrrhula",
+    "sitta_europaea",
+    "sturnus_vulgaris",
+    "turdus_merula",
+};
