@@ -9,10 +9,10 @@ void send_image(const uint8_t* jpeg_data, size_t jpeg_size)
     ESP_LOGI("MQTT", "JPEG sent with msg_id=%d, size=%zu bytes", msg_id, jpeg_size);
 }
 
-void send_classification(const dl::cls::result_t &classification)
+void send_classification(const dl::cls::result_t &classification, float weight_g)
 {
     char classification_str[256];
-    snprintf(classification_str, sizeof(classification_str), "%s,%.4f", classification.cat_name, classification.score);
+    snprintf(classification_str, sizeof(classification_str), "%s,%.4f,%.2f", classification.cat_name, classification.score, weight_g);
     int msg_id = esp_mqtt_client_publish(client, "classification", (const char *)classification_str, strlen(classification_str), 0, 0);
     ESP_LOGI("MQTT", "Classification sent with msg_id=%d, size=%zu bytes", msg_id, strlen(classification_str));
 }

@@ -21,13 +21,15 @@
 #include <dirent.h>
 #include <vector>
 #include <limits>
+#include <map>
+#include <string>
 
 #include "include/camera_pins.h"
 #include "include/hx711.hpp"
 
 #define HX711_DATA_PIN           14
 #define HX711_CLK_PIN            48
-#define HX711_WEIGHT_THRESHOLD_G 5.0f
+#define HX711_WEIGHT_THRESHOLD_G 6.0f
 
 #define MAX_CAPTURE_IMAGES  200
 #define MIN_CAPTURE_IMAGES  50
@@ -105,11 +107,13 @@ static dl::image::ImagePreprocessor *s_preprocessor = nullptr;
 // Capture session shared state
 #define CAPTURE_DONE_BIT  BIT0
 #define CLASSIFY_DONE_BIT BIT1
+#define WEIGHT_CONFIRMED_BIT BIT2
+#define WEIGHT_REJECTED_BIT  BIT3
 
 struct CaptureSession {
     dl::image::jpeg_img_t images[MAX_CAPTURE_IMAGES];
     volatile int image_count;
-    SemaphoreHandle_t first_image_sem;
+    float initial_weight_g;
     EventGroupHandle_t done_event;
 };
 static CaptureSession s_session;
@@ -335,6 +339,16 @@ static bool capture_image(dl::image::jpeg_img_t &output_img) {
 static void capture_and_send_task(void *pvParameters) {
     s_session.image_count = 0;
 
+    // Flush stale frame buffers from the camera driver.
+    // With fb_count=2 and CAMERA_GRAB_WHEN_EMPTY, both buffers contain
+    // old frames from before this session started.
+    for (int i = 0; i < camera_config.fb_count; i++) {
+        camera_fb_t *stale = esp_camera_fb_get();
+        if (stale) {
+            esp_camera_fb_return(stale);
+        }
+    }
+
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(CAPTURE_INTERVAL_MS);
 
@@ -360,13 +374,24 @@ static void capture_and_send_task(void *pvParameters) {
         s_session.images[s_session.image_count] = img;
         s_session.image_count++;
 
-        // Signal classification task after first successful capture
-        if (s_session.image_count == 1) {
-            xSemaphoreGive(s_session.first_image_sem);
-        }
+        // image_count updated; classify_task waits for CAPTURE_DONE_BIT
     }
 
-    ESP_LOGI("CAPTURE", "Captured %d images. Sending via MQTT...", s_session.image_count);
+    ESP_LOGI("CAPTURE", "Captured %d images. Waiting for weight confirmation...", s_session.image_count);
+
+    // Wait for the main loop to confirm or reject the weight reading
+    EventBits_t bits = xEventGroupWaitBits(s_session.done_event,
+                                           WEIGHT_CONFIRMED_BIT | WEIGHT_REJECTED_BIT,
+                                           pdFALSE, pdFALSE, portMAX_DELAY);
+
+    if (bits & WEIGHT_REJECTED_BIT) {
+        ESP_LOGW("CAPTURE", "Weight not confirmed — discarding %d images", s_session.image_count);
+        xEventGroupSetBits(s_session.done_event, CAPTURE_DONE_BIT);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI("CAPTURE", "Weight confirmed. Sending %d images via MQTT...", s_session.image_count);
 
     for (int i = 0; i < s_session.image_count; i++) {
         if (s_session.images[i].data) {
@@ -380,57 +405,106 @@ static void capture_and_send_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-// Classification task: waits for first captured image, classifies it, sends result via MQTT.
+// Classification task: classifies every 10th image as it becomes available during capture,
+// then sends the majority class with its average confidence score via MQTT.
 static void classify_task(void *pvParameters) {
-    if (xSemaphoreTake(s_session.first_image_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
-        ESP_LOGE("CLASSIFY", "Timeout waiting for first image");
+    // Classify every 10th image and accumulate per-class stats
+    std::map<std::string, std::pair<int, float>> class_stats; // class -> (vote_count, score_sum)
+    int next_classify_idx = 0;
+
+    // Process images as they arrive; stop when capture is done and no more remain
+    while (true) {
+        // If weight was rejected, bail out early
+        EventBits_t wbits = xEventGroupGetBits(s_session.done_event);
+        if (wbits & WEIGHT_REJECTED_BIT) {
+            ESP_LOGW("CLASSIFY", "Weight not confirmed — skipping classification");
+            xEventGroupSetBits(s_session.done_event, CLASSIFY_DONE_BIT);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        bool capture_done = (wbits & CAPTURE_DONE_BIT) != 0;
+
+        if (s_session.image_count > next_classify_idx) {
+            dl::image::img_t decoded_img;
+            decoded_img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
+
+            esp_err_t decode_err = dl::image::sw_decode_jpeg(s_session.images[next_classify_idx], decoded_img, true);
+            if (decode_err != ESP_OK) {
+                ESP_LOGW("CLASSIFY", "Failed to decode JPEG at index %d, skipping", next_classify_idx);
+            } else {
+                dl::cls::result_t res = run_inference(s_model, s_preprocessor, decoded_img);
+                if (res.cat_name) {
+                    ESP_LOGI("CLASSIFY", "[img %d] %s (%.4f)", next_classify_idx, res.cat_name, res.score);
+                    auto &entry = class_stats[res.cat_name];
+                    entry.first++;
+                    entry.second += res.score;
+                }
+                free(decoded_img.data);
+                decoded_img.data = nullptr;
+            }
+            next_classify_idx += 10;
+        } else if (capture_done) {
+            break;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    int count = s_session.image_count;
+    ESP_LOGI("CLASSIFY", "Classification done (%d images classified). Total captured: %d", next_classify_idx / 10, count);
+
+    if (class_stats.empty()) {
+        ESP_LOGW("CLASSIFY", "No valid predictions obtained");
         xEventGroupSetBits(s_session.done_event, CLASSIFY_DONE_BIT);
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI("CLASSIFY", "First image available — running classification");
-
-    dl::image::jpeg_img_t *img_jpeg = &s_session.images[0];
-    dl::image::img_t decoded_img;
-    decoded_img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
-
-    esp_err_t decode_err = dl::image::sw_decode_jpeg(*img_jpeg, decoded_img, true);
-    if (decode_err != ESP_OK) {
-        ESP_LOGE("CLASSIFY", "Failed to decode JPEG");
-    } else {
-        dl::cls::result_t best = run_inference(s_model, s_preprocessor, decoded_img);
-        if (best.cat_name) {
-            ESP_LOGI("CLASSIFY", "Prediction: %s (score: %.4f)", best.cat_name, best.score);
-        } else {
-            ESP_LOGW("CLASSIFY", "No valid prediction");
+    // Find the majority class (most votes); use average confidence for that class
+    std::string majority_class;
+    int max_votes = 0;
+    float majority_score_sum = 0.0f;
+    for (auto &kv : class_stats) {
+        if (kv.second.first > max_votes) {
+            max_votes = kv.second.first;
+            majority_score_sum = kv.second.second;
+            majority_class = kv.first;
         }
+    }
+    float avg_confidence = majority_score_sum / max_votes;
 
-        mqtt::send_classification(best);
+    ESP_LOGI("CLASSIFY", "Result: %s avg_score=%.4f (votes=%d/%zu)",
+             majority_class.c_str(), avg_confidence, max_votes, class_stats.size());
 
-        // Log entry to SD card
-        time_t ts;
-        time(&ts);
-        struct tm tm_info;
-        localtime_r(&ts, &tm_info);
+    dl::cls::result_t avg_result = {};
+    avg_result.cat_name = majority_class.c_str();
+    avg_result.score    = avg_confidence;
 
-        char timestamp[32];
-        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info);
+    mqtt::send_classification(avg_result, s_session.initial_weight_g);
 
-        char line[128];
-        const char *cat = best.cat_name ? best.cat_name : "background";
-        snprintf(line, sizeof(line), "%s %s score=%.4f", timestamp, cat, best.score);
+    // Log entry to SD card
+    time_t ts;
+    time(&ts);
+    struct tm tm_info;
+    localtime_r(&ts, &tm_info);
 
-        if (!sdcard::append_line(background_log_path, line)) {
-            ESP_LOGE("SD", "Failed to append log");
-        }
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info);
 
-        if (!sdcard::save_classified_jpeg(*img_jpeg, best, out_dir)) {
+    char line[160];
+    snprintf(line, sizeof(line), "%s %s avg_score=%.4f votes=%d",
+             timestamp, majority_class.c_str(), avg_confidence, max_votes);
+
+    if (!sdcard::append_line(background_log_path, line)) {
+        ESP_LOGE("SD", "Failed to append log");
+    }
+
+    // Save the first image as a representative sample
+    if (count > 0 && s_session.images[0].data) {
+        if (!sdcard::save_classified_jpeg(s_session.images[0], avg_result, out_dir)) {
             ESP_LOGE("SD", "Failed to save classified JPEG");
         }
-
-        free(decoded_img.data);
-        decoded_img.data = nullptr;
     }
 
     xEventGroupSetBits(s_session.done_event, CLASSIFY_DONE_BIT);
@@ -508,16 +582,29 @@ extern "C" void app_main(void) {
         float weight = hx711_read_grams();
 
         if (weight >= HX711_WEIGHT_THRESHOLD_G) {
-            ESP_LOGI(TAG, "Weight detected: %.2f g — starting capture session", weight);
+            ESP_LOGI(TAG, "Weight detected: %.2f g — starting session (pending confirmation)", weight);
 
             // Initialize session
             memset(&s_session, 0, sizeof(s_session));
-            s_session.first_image_sem = xSemaphoreCreateBinary();
+            s_session.initial_weight_g = weight;
             s_session.done_event = xEventGroupCreate();
 
             // Launch capture task on core 0, classification task on core 1
             xTaskCreatePinnedToCore(capture_and_send_task, "capture",  8192 * 2, NULL, 19, NULL, 0);
             xTaskCreatePinnedToCore(classify_task,         "classify", 8192 * 2, NULL, 20, NULL, 1);
+
+            // Wait 500 ms for HX711 to be ready, then take a confirmation reading
+            vTaskDelay(pdMS_TO_TICKS(500));
+            float weight2 = hx711_read_grams();
+            if (weight2 >= HX711_WEIGHT_THRESHOLD_G) {
+                float confirmed = (weight + weight2) / 2.0f;
+                s_session.initial_weight_g = confirmed;
+                ESP_LOGI(TAG, "Weight confirmed: %.2f g (%.2f + %.2f)", confirmed, weight, weight2);
+                xEventGroupSetBits(s_session.done_event, WEIGHT_CONFIRMED_BIT);
+            } else {
+                ESP_LOGI(TAG, "False trigger (%.2f g then %.2f g) — aborting session", weight, weight2);
+                xEventGroupSetBits(s_session.done_event, WEIGHT_REJECTED_BIT);
+            }
 
             // Wait for both tasks to finish
             xEventGroupWaitBits(s_session.done_event,
@@ -532,7 +619,6 @@ extern "C" void app_main(void) {
                 }
             }
 
-            vSemaphoreDelete(s_session.first_image_sem);
             vEventGroupDelete(s_session.done_event);
 
             ESP_LOGI(TAG, "Session complete (%d images). Waiting for weight to clear...", s_session.image_count);
